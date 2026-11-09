@@ -1,0 +1,8 @@
+{
+    "recommendations": [
+        "slevesque.shader",
+        "LaurentLeBrun.spirv-syntax",
+        "circledev.glsl-lsp"
+    ]
+}
+

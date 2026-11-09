@@ -1,9 +1,13 @@
 # Shader compiler for vulkan-llm-decode
 param (
-    [string]$ShaderDir = "$PSScriptRoot\shaders",
-    [string]$OutputDir = "$PSScriptRoot\spirv",
+    [string]$ShaderDir = "",
+    [string]$OutputDir = "",
     [switch]$Disassemble = $true
 )
+
+$RootDir = Split-Path -Parent $PSScriptRoot
+if (-not $ShaderDir) { $ShaderDir = "$RootDir\shaders" }
+if (-not $OutputDir) { $OutputDir = "$RootDir\spirv" }
 
 $ErrorActionPreference = "Stop"
 

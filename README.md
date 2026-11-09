@@ -34,12 +34,14 @@ $$\text{Roofline Ceiling} \approx \frac{16.28\text{ GB/s}}{0.295\text{ GB}} \app
 ## 📁 Repository Structure
 ```
 vulkan-llm-decode/
+├── .vscode/        # VS Code tasks and shader language configurations
+├── bin/            # Compiled benchmark executables (git-ignored)
 ├── libs/           # Windows CRT import libraries (kernel32.lib, msvcrt.lib)
+├── scripts/        # PowerShell automation & benchmark build scripts
 ├── shaders/        # GLSL compute kernels (FP16, INT8 DP4A, INT4 fused GEMV)
 ├── spirv/          # Compiled SPIR-V bytecode & assembly (.spvasm)
 ├── src/            # Host benchmark & inference runtime (C / Vulkan)
-├── compile_shaders.ps1 / .bat
-├── run_bandwidth_test.ps1 / .bat
+├── .gitignore
 └── README.md
 ```
 
@@ -49,11 +51,11 @@ vulkan-llm-decode/
 
 ### 1. Compile Shaders
 ```powershell
-.\compile_shaders.ps1
+.\scripts\compile_shaders.ps1
 ```
 
 ### 2. Run Memory Bandwidth Benchmark
 ```powershell
-.\run_bandwidth_test.ps1
+.\scripts\run_bandwidth_test.ps1
 ```
 

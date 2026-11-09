@@ -1,0 +1,13 @@
+{
+    "files.associations": {
+        "*.comp": "glsl",
+        "*.vert": "glsl",
+        "*.frag": "glsl",
+        "*.geom": "glsl",
+        "*.tesc": "glsl",
+        "*.tese": "glsl",
+        "*.spvasm": "spirv",
+        "*.hlsl": "hlsl"
+    }
+}
+

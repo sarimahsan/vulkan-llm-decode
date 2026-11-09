@@ -10,7 +10,7 @@
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                "${workspaceFolder}/run_bandwidth_test.ps1"
+                "${workspaceFolder}/scripts/run_bandwidth_test.ps1"
             ],
             "group": {
                 "kind": "test",
@@ -27,7 +27,7 @@
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                "${workspaceFolder}/compile_shaders.ps1"
+                "${workspaceFolder}/scripts/compile_shaders.ps1"
             ],
             "group": {
                 "kind": "build",

@@ -4,12 +4,15 @@ bin/
 out/
 *.exe
 *.obj
-*.lib
 *.pdb
 *.ilk
+*.lib
+!libs/*.lib
 
 # VS Code / IDE
 .vs/
 .vscode/*
 !.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
 
