@@ -1,0 +1,16 @@
+LIBRARY MSVCRT.DLL
+EXPORTS
+printf
+puts
+putchar
+malloc
+free
+memcpy
+memset
+exit
+fopen
+fclose
+fread
+fseek
+ftell
+

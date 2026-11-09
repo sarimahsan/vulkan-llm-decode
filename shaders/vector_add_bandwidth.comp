@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer ABuffer {
+    vec4 A[];
+};
+
+layout(set = 0, binding = 1) readonly buffer BBuffer {
+    vec4 B[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer CBuffer {
+    vec4 C[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint numElements; // total number of vec4 elements
+} pc;
+
+void main() {
+    // 4x unrolled 128-bit vector arithmetic and memory access
+    uint baseIdx = gl_GlobalInvocationID.x * 4;
+
+    if (baseIdx + 3 < pc.numElements) {
+        C[baseIdx + 0] = A[baseIdx + 0] + B[baseIdx + 0];
+        C[baseIdx + 1] = A[baseIdx + 1] + B[baseIdx + 1];
+        C[baseIdx + 2] = A[baseIdx + 2] + B[baseIdx + 2];
+        C[baseIdx + 3] = A[baseIdx + 3] + B[baseIdx + 3];
+    } else {
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = baseIdx + i;
+            if (idx < pc.numElements) {
+                C[idx] = A[idx] + B[idx];
+            }
+        }
+    }
+}
+

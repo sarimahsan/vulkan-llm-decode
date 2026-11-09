@@ -1,0 +1,51 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// 128 threads per workgroup = 4 subgroups of 32 threads
+// Each subgroup computes 1 output row of GEMV (y = W * x)
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[]; // Vector of length K (stored as f16vec4)
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrix {
+    f16vec4 W[]; // Matrix of shape N x K (stored as f16vec4, row-major)
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVector {
+    float16_t y[]; // Output vector of length N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_vec4; // K / 4
+    uint N;      // Number of rows
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+
+    float16_t acc = float16_t(0.0);
+
+    // Each lane processes elements strided by 32 vec4s (128 elements per step)
+    uint rowOffset = row * pc.K_vec4;
+    for (uint col = laneId; col < pc.K_vec4; col += 32) {
+        f16vec4 w_val = W[rowOffset + col];
+        f16vec4 x_val = x[col];
+        acc += dot(w_val, x_val);
+    }
+
+    // Hardware SIMD32 Subgroup Reduction
+    float16_t rowSum = subgroupAdd(acc);
+
+    // Lane 0 writes the scalar result for this row
+    if (laneId == 0) {
+        y[row] = rowSum;
+    }
+}
+

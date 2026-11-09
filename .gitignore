@@ -1,0 +1,15 @@
+# Build & Binaries
+build/
+bin/
+out/
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+
+# VS Code / IDE
+.vs/
+.vscode/*
+!.vscode/tasks.json
+
