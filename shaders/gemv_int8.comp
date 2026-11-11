@@ -1,0 +1,91 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// 128 threads per workgroup = 4 subgroups of 32 threads
+// Each subgroup computes 1 output row of GEMV (y = W * x)
+// Weights are INT8: 4 signed int8 weights per uint32_t (16 weights per uvec4)
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[]; // Vector of length K (stored as f16vec4)
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixINT8 {
+    uvec4 W[]; // Matrix of shape N x (K / 16) (stored as uvec4, row-major)
+};
+
+layout(set = 0, binding = 2) readonly buffer ScaleVector {
+    float16_t scales[]; // Per-row FP16 scale factors (length N)
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputVector {
+    float16_t y[]; // Output vector of length N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_uvec4; // K / 16
+    uint N;       // Number of rows
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+
+    float16_t acc = float16_t(0.0);
+
+    // Each lane processes elements strided by 32 uvec4s (512 elements per step)
+    uint rowOffset = row * pc.K_uvec4;
+    for (uint col = laneId; col < pc.K_uvec4; col += 32) {
+        uvec4 packed_w = W[rowOffset + col];
+        uint x_base = col * 4; // each uvec4 corresponds to 4 f16vec4s (16 elements)
+
+        // Unpack packed_w.x (4 signed int8 weights: 1 f16vec4)
+        f16vec4 w0 = f16vec4(
+            float16_t(bitfieldExtract(int(packed_w.x), 0, 8)),
+            float16_t(bitfieldExtract(int(packed_w.x), 8, 8)),
+            float16_t(bitfieldExtract(int(packed_w.x), 16, 8)),
+            float16_t(bitfieldExtract(int(packed_w.x), 24, 8))
+        );
+        acc += dot(w0, x[x_base + 0]);
+
+        // Unpack packed_w.y (4 signed int8 weights: 1 f16vec4)
+        f16vec4 w1 = f16vec4(
+            float16_t(bitfieldExtract(int(packed_w.y), 0, 8)),
+            float16_t(bitfieldExtract(int(packed_w.y), 8, 8)),
+            float16_t(bitfieldExtract(int(packed_w.y), 16, 8)),
+            float16_t(bitfieldExtract(int(packed_w.y), 24, 8))
+        );
+        acc += dot(w1, x[x_base + 1]);
+
+        // Unpack packed_w.z (4 signed int8 weights: 1 f16vec4)
+        f16vec4 w2 = f16vec4(
+            float16_t(bitfieldExtract(int(packed_w.z), 0, 8)),
+            float16_t(bitfieldExtract(int(packed_w.z), 8, 8)),
+            float16_t(bitfieldExtract(int(packed_w.z), 16, 8)),
+            float16_t(bitfieldExtract(int(packed_w.z), 24, 8))
+        );
+        acc += dot(w2, x[x_base + 2]);
+
+        // Unpack packed_w.w (4 signed int8 weights: 1 f16vec4)
+        f16vec4 w3 = f16vec4(
+            float16_t(bitfieldExtract(int(packed_w.w), 0, 8)),
+            float16_t(bitfieldExtract(int(packed_w.w), 8, 8)),
+            float16_t(bitfieldExtract(int(packed_w.w), 16, 8)),
+            float16_t(bitfieldExtract(int(packed_w.w), 24, 8))
+        );
+        acc += dot(w3, x[x_base + 3]);
+    }
+
+    // Hardware SIMD32 Subgroup Reduction
+    float16_t rowSum = subgroupAdd(acc);
+
+    // Lane 0 applies per-row scale factor and writes output
+    if (laneId == 0) {
+        y[row] = rowSum * scales[row];
+    }
+}
+

@@ -1,0 +1,115 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// 128 threads per workgroup = 4 subgroups of 32 threads
+// Each subgroup computes 1 output row of GEMV (y = W * x)
+// Weights are INT4 packed: 8 weights per uint32_t (32 weights per uvec4)
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[]; // Vector of length K (stored as f16vec4)
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixINT4 {
+    uvec4 W[]; // Matrix of shape N x (K / 32) (stored as uvec4, row-major)
+};
+
+layout(set = 0, binding = 2) readonly buffer ScaleVector {
+    float16_t scales[]; // Per-row FP16 scale factors (length N)
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputVector {
+    float16_t y[]; // Output vector of length N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_uvec4; // K / 32
+    uint N;       // Number of rows
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+
+    float16_t acc = float16_t(0.0);
+
+    // Each lane processes elements strided by 32 uvec4s (1024 elements per step)
+    uint rowOffset = row * pc.K_uvec4;
+    for (uint col = laneId; col < pc.K_uvec4; col += 32) {
+        uvec4 packed_w = W[rowOffset + col];
+        uint x_base = col * 8; // each uvec4 corresponds to 8 f16vec4s (32 elements)
+
+        // Unpack component x (8 weights: 2 f16vec4s)
+        f16vec4 w0 = f16vec4(
+            float16_t(int(packed_w.x & 0x0Fu) - 8),
+            float16_t(int((packed_w.x >> 4u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.x >> 8u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.x >> 12u) & 0x0Fu) - 8)
+        );
+        f16vec4 w1 = f16vec4(
+            float16_t(int((packed_w.x >> 16u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.x >> 20u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.x >> 24u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.x >> 28u) & 0x0Fu) - 8)
+        );
+        acc += dot(w0, x[x_base + 0]) + dot(w1, x[x_base + 1]);
+
+        // Unpack component y (8 weights: 2 f16vec4s)
+        f16vec4 w2 = f16vec4(
+            float16_t(int(packed_w.y & 0x0Fu) - 8),
+            float16_t(int((packed_w.y >> 4u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.y >> 8u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.y >> 12u) & 0x0Fu) - 8)
+        );
+        f16vec4 w3 = f16vec4(
+            float16_t(int((packed_w.y >> 16u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.y >> 20u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.y >> 24u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.y >> 28u) & 0x0Fu) - 8)
+        );
+        acc += dot(w2, x[x_base + 2]) + dot(w3, x[x_base + 3]);
+
+        // Unpack component z (8 weights: 2 f16vec4s)
+        f16vec4 w4 = f16vec4(
+            float16_t(int(packed_w.z & 0x0Fu) - 8),
+            float16_t(int((packed_w.z >> 4u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.z >> 8u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.z >> 12u) & 0x0Fu) - 8)
+        );
+        f16vec4 w5 = f16vec4(
+            float16_t(int((packed_w.z >> 16u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.z >> 20u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.z >> 24u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.z >> 28u) & 0x0Fu) - 8)
+        );
+        acc += dot(w4, x[x_base + 4]) + dot(w5, x[x_base + 5]);
+
+        // Unpack component w (8 weights: 2 f16vec4s)
+        f16vec4 w6 = f16vec4(
+            float16_t(int(packed_w.w & 0x0Fu) - 8),
+            float16_t(int((packed_w.w >> 4u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.w >> 8u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.w >> 12u) & 0x0Fu) - 8)
+        );
+        f16vec4 w7 = f16vec4(
+            float16_t(int((packed_w.w >> 16u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.w >> 20u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.w >> 24u) & 0x0Fu) - 8),
+            float16_t(int((packed_w.w >> 28u) & 0x0Fu) - 8)
+        );
+        acc += dot(w6, x[x_base + 6]) + dot(w7, x[x_base + 7]);
+    }
+
+    // Hardware SIMD32 Subgroup Reduction
+    float16_t rowSum = subgroupAdd(acc);
+
+    // Lane 0 applies per-row scale factor and writes output
+    if (laneId == 0) {
+        y[row] = rowSum * scales[row];
+    }
+}
+
