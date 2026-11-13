@@ -3,7 +3,9 @@
 > **Bandwidth-Roofline LLM Decode Engine on Vulkan**  
 > Fused INT4/INT8 dequant-GEMV kernels for LLM decoding on bandwidth-constrained Intel Xe-LP (UHD Graphics) architectures.
 
-<video src="assets/vulkan-llm-decode.mp4" controls muted playsinline width="100%" autoplay></video>
+<video src="https://github.com/sarimahsan/vulkan-llm-decode/raw/main/assets/vulkan-llm-decode.mp4" controls muted playsinline width="100%" autoplay></video>
+
+[▶ Watch 20s Project Showcase](https://github.com/sarimahsan/vulkan-llm-decode/blob/main/assets/vulkan-llm-decode.mp4)
 
 ---
 
