@@ -1,0 +1,32 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Vectorized elementwise SwiGLU: out = (gate / (1 + exp(-gate))) * up
+layout(local_size_x = 128, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GateVector {
+    f16vec4 gate[];
+};
+
+layout(set = 0, binding = 1) readonly buffer UpVector {
+    f16vec4 up[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVector {
+    f16vec4 out_vec[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint N_vec4; // Total elements / 4
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.N_vec4) return;
+
+    vec4 vg = vec4(gate[idx]);
+    vec4 vu = vec4(up[idx]);
+    vec4 silu = vg / (vec4(1.0) + exp(-vg));
+    out_vec[idx] = f16vec4(silu * vu);
+}
+

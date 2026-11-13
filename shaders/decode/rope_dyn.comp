@@ -1,0 +1,49 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Dynamic-pos In-place Rotary Position Embedding (RoPE, NeoX half-split style)
+layout(local_size_x = 64, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) buffer QueryVector { float16_t q[]; };
+layout(set = 0, binding = 1) buffer KeyVector { float16_t k[]; };
+layout(set = 0, binding = 2) readonly buffer DecodeState { uint pos_state[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    float rope_theta;
+} pc;
+
+void main() {
+    uint half_dim = pc.head_dim >> 1;
+    uint total_q_pairs = pc.num_q_heads * half_dim;
+    uint total_pairs = total_q_pairs + pc.num_kv_heads * half_dim;
+
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total_pairs) return;
+
+    uint pos = pos_state[0];
+    bool is_q = (idx < total_q_pairs);
+    uint local_idx = is_q ? idx : (idx - total_q_pairs);
+    uint head = local_idx / half_dim;
+    uint j = local_idx % half_dim;
+
+    float freq = float(pos) * exp(-2.0 * float(j) / float(pc.head_dim) * log(pc.rope_theta));
+    float c = cos(freq);
+    float s = sin(freq);
+
+    uint base = head * pc.head_dim;
+    if (is_q) {
+        float x0 = float(q[base + j]);
+        float x1 = float(q[base + j + half_dim]);
+        q[base + j]            = float16_t(x0 * c - x1 * s);
+        q[base + j + half_dim] = float16_t(x0 * s + x1 * c);
+    } else {
+        float x0 = float(k[base + j]);
+        float x1 = float(k[base + j + half_dim]);
+        k[base + j]            = float16_t(x0 * c - x1 * s);
+        k[base + j + half_dim] = float16_t(x0 * s + x1 * c);
+    }
+}
+

@@ -1,0 +1,113 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// FlashDecoding-style Single-Token (M=1) GQA Attention
+// 256 threads = 8 SIMD32 subgroups per query head.
+// Each subgroup processes a strided slice of seq_len with independent Online Softmax,
+// then all 8 subgroups merge via shared memory at the end.
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+    f16vec4 Q[]; // [num_q_heads, head_dim / 4]
+};
+
+layout(set = 0, binding = 1) readonly buffer KeyCache {
+    f16vec4 K_cache[]; // [seq_len, num_kv_heads, head_dim / 4]
+};
+
+layout(set = 0, binding = 2) readonly buffer ValueCache {
+    f16vec4 V_cache[]; // [seq_len, num_kv_heads, head_dim / 4]
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputBuffer {
+    f16vec4 O[]; // [num_q_heads, head_dim / 4]
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;  // e.g. 64 or 128 (multiple of 4, <= 128)
+    uint seq_len;   // Number of tokens in KV cache
+    float scale;    // 1.0 / sqrt(head_dim)
+} pc;
+
+shared float s_m[8];
+shared float s_l[8];
+shared vec4  s_o[8][32]; // Up to 32 vec4s (= 128 dims) per subgroup
+
+void main() {
+    uint q_head = gl_WorkGroupID.x;
+    if (q_head >= pc.num_q_heads) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+    uint sgId   = gl_LocalInvocationID.y; // 0..7
+
+    uint gqa_group = pc.num_q_heads / pc.num_kv_heads;
+    uint kv_head   = q_head / gqa_group;
+    uint dim_vec4  = pc.head_dim >> 2;   // e.g. 32 for head_dim=128, 16 for head_dim=64
+    uint q_base_v4 = q_head * dim_vec4;
+
+    // Load Q slice into registers (1 f16vec4 per lane covers head_dim <= 128)
+    vec4 q_reg = (laneId < dim_vec4) ? vec4(Q[q_base_v4 + laneId]) : vec4(0.0);
+    vec4 o_reg = vec4(0.0);
+
+    float m_prev = -1e30;
+    float l_prev = 0.0;
+    uint kv_stride_v4 = pc.num_kv_heads * dim_vec4;
+    uint kv_head_off_v4 = kv_head * dim_vec4;
+
+    // Each of the 8 subgroups processes tokens strided by 8
+    for (uint t = sgId; t < pc.seq_len; t += 8) {
+        uint kv_base_v4 = t * kv_stride_v4 + kv_head_off_v4;
+
+        float partial_dot = 0.0;
+        if (laneId < dim_vec4) {
+            vec4 k_val = vec4(K_cache[kv_base_v4 + laneId]);
+            partial_dot = dot(q_reg, k_val);
+        }
+        float score = subgroupAdd(partial_dot) * pc.scale;
+
+        float m_new = max(m_prev, score);
+        float alpha = exp(m_prev - m_new);
+        float beta  = exp(score - m_new);
+        l_prev = l_prev * alpha + beta;
+        m_prev = m_new;
+
+        if (laneId < dim_vec4) {
+            vec4 v_val = vec4(V_cache[kv_base_v4 + laneId]);
+            o_reg = o_reg * alpha + beta * v_val;
+        }
+    }
+
+    // Store per-subgroup Online Softmax state to shared memory
+    if (laneId == 0) {
+        s_m[sgId] = m_prev;
+        s_l[sgId] = l_prev;
+    }
+    if (laneId < dim_vec4) {
+        s_o[sgId][laneId] = o_reg;
+    }
+    barrier();
+
+    // Subgroup 0 merges all 8 subgroup states and writes final output
+    if (sgId == 0 && laneId < dim_vec4) {
+        float m_global = -1e30;
+        for (uint s = 0; s < 8; ++s) {
+            m_global = max(m_global, s_m[s]);
+        }
+
+        float l_global = 0.0;
+        vec4 o_global = vec4(0.0);
+        for (uint s = 0; s < 8; ++s) {
+            if (s_l[s] > 0.0) {
+                float w = exp(s_m[s] - m_global);
+                l_global += s_l[s] * w;
+                o_global += s_o[s][laneId] * w;
+            }
+        }
+
+        float inv_l = (l_global > 0.0) ? (1.0 / l_global) : 0.0;
+        O[q_base_v4 + laneId] = f16vec4(o_global * inv_l);
+    }
+}

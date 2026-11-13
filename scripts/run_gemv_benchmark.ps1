@@ -12,14 +12,14 @@ if (-not (Test-Path $binDir)) {
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 }
 
-$src = "$RootDir\src\gemv_benchmark.c"
+$src = "$RootDir\src\benchmarks\gemv_benchmark.c"
 $outExe = "$binDir\gemv_benchmark.exe"
 $vulkanInc = "$env:VULKAN_SDK\Include"
 $vulkanLib = "$env:VULKAN_SDK\Lib\vulkan-1.lib"
 $k32Lib = "$RootDir\libs\kernel32.lib"
 $crtLib = "$RootDir\libs\msvcrt.lib"
 
-& H:\LLVM\bin\clang.exe -O3 -nostdlib -I "$vulkanInc" `
+& H:\LLVM\bin\clang.exe -O3 -nostdlib -I "$vulkanInc" -I "$RootDir\src\engine" `
     -Xlinker /subsystem:console `
     -Xlinker /entry:mainCRTStartup `
     "$src" "$k32Lib" "$crtLib" "$vulkanLib" `

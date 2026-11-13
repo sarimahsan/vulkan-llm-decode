@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Batched KV Append into cache[pos + m] (dispatch (kv_dim_vec4+63)/64, M, 1)
+layout(local_size_x = 64, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer KIn { f16vec4 k_in[]; };
+layout(set = 0, binding = 1) readonly buffer VIn { f16vec4 v_in[]; };
+layout(set = 0, binding = 2) writeonly buffer KCache { f16vec4 k_cache[]; };
+layout(set = 0, binding = 3) writeonly buffer VCache { f16vec4 v_cache[]; };
+layout(set = 0, binding = 4) readonly buffer DecodeState { uint pos_state[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint kv_dim_vec4;    // KV_DIM / 4
+    uint in_stride_vec4; // (H + 2 * KV_DIM) / 4
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.kv_dim_vec4) return;
+    uint m = gl_WorkGroupID.y;
+    uint src = m * pc.in_stride_vec4 + idx;
+    uint dst = (pos_state[0] + m) * pc.kv_dim_vec4 + idx;
+    k_cache[dst] = k_in[src];
+    v_cache[dst] = v_in[src];
+}
+

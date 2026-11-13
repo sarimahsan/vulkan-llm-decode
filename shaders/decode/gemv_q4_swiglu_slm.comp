@@ -1,0 +1,101 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused Gate + Up Group-32 INT4 GEMV + SwiGLU Activation with SLM input x caching.
+// 256 threads per workgroup = 8 subgroups of 32 threads (8 rows/workgroup).
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector  { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer GateWeights  { uvec4 W_gate[]; };
+layout(set = 0, binding = 2) readonly buffer GateScales   { float16_t S_gate[]; };
+layout(set = 0, binding = 3) readonly buffer UpWeights    { uvec4 W_up[]; };
+layout(set = 0, binding = 4) readonly buffer UpScales     { float16_t S_up[]; };
+layout(set = 0, binding = 5) writeonly buffer OutputVector { float16_t y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint K_group32; // K / 32
+    uint N;         // Intermediate size (I)
+} pc;
+
+shared f16vec4 s_x[256]; // Up to K = 1024 (256 f16vec4s = 2 KB SLM)
+
+void main() {
+    uint tid = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x;
+    uint K_vec4 = pc.K_group32 * 8u;
+
+    for (uint i = tid; i < K_vec4; i += 256u) {
+        s_x[i] = x[i];
+    }
+    barrier();
+
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x;
+
+    float16_t acc_g = float16_t(0.0);
+    float16_t acc_u = float16_t(0.0);
+
+    uint rowOffset = row * pc.K_group32;
+    for (uint col = laneId; col < pc.K_group32; col += 32u) {
+        uint blockIdx = rowOffset + col;
+        uvec4 pg = W_gate[blockIdx];
+        uvec4 pu = W_up[blockIdx];
+        float16_t dg = S_gate[blockIdx];
+        float16_t du = S_up[blockIdx];
+
+        uint x_base = col * 8u;
+        float16_t gd_g = float16_t(0.0);
+        float16_t gd_u = float16_t(0.0);
+
+        for (uint c = 0u; c < 4u; ++c) {
+            f16vec4 x0 = s_x[x_base + c * 2u + 0u];
+            f16vec4 x1 = s_x[x_base + c * 2u + 1u];
+
+            uint gword = pg[c];
+            f16vec4 wg0 = f16vec4(
+                float16_t(bitfieldExtract(gword,  0, 4)),
+                float16_t(bitfieldExtract(gword,  4, 4)),
+                float16_t(bitfieldExtract(gword,  8, 4)),
+                float16_t(bitfieldExtract(gword, 12, 4))
+            ) - float16_t(8.0);
+            f16vec4 wg1 = f16vec4(
+                float16_t(bitfieldExtract(gword, 16, 4)),
+                float16_t(bitfieldExtract(gword, 20, 4)),
+                float16_t(bitfieldExtract(gword, 24, 4)),
+                float16_t(bitfieldExtract(gword, 28, 4))
+            ) - float16_t(8.0);
+            gd_g += dot(wg0, x0) + dot(wg1, x1);
+
+            uint uword = pu[c];
+            f16vec4 wu0 = f16vec4(
+                float16_t(bitfieldExtract(uword,  0, 4)),
+                float16_t(bitfieldExtract(uword,  4, 4)),
+                float16_t(bitfieldExtract(uword,  8, 4)),
+                float16_t(bitfieldExtract(uword, 12, 4))
+            ) - float16_t(8.0);
+            f16vec4 wu1 = f16vec4(
+                float16_t(bitfieldExtract(uword, 16, 4)),
+                float16_t(bitfieldExtract(uword, 20, 4)),
+                float16_t(bitfieldExtract(uword, 24, 4)),
+                float16_t(bitfieldExtract(uword, 28, 4))
+            ) - float16_t(8.0);
+            gd_u += dot(wu0, x0) + dot(wu1, x1);
+        }
+
+        acc_g += gd_g * dg;
+        acc_u += gd_u * du;
+    }
+
+    float16_t g_val = subgroupAdd(acc_g);
+    float16_t u_val = subgroupAdd(acc_u);
+
+    if (laneId == 0u) {
+        float gf = float(g_val);
+        float silu = gf / (1.0 + exp(-gf));
+        y[row] = float16_t(silu * float(u_val));
+    }
+}
+

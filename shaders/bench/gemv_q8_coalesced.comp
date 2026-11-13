@@ -1,0 +1,77 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Coalesced Group-32 Q8_0 GEMV:
+// Weights are repacked into 2 x uvec4 (32 bytes = 32 int8 weights) per block,
+// with separate FP16 scales[] for 128-bit coalesced cache-line reads.
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[]; // Vector of length K (stored as f16vec4)
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixQ8 {
+    uvec4 W[]; // 2 x uvec4 per 32-weight block: [blockIdx * 2 + 0], [blockIdx * 2 + 1]
+};
+
+layout(set = 0, binding = 2) readonly buffer ScaleMatrix {
+    float16_t scales[]; // 1 FP16 scale per 32-weight block
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputVector {
+    float16_t y[]; // Output vector of length N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_blocks; // K / 32
+    uint N;        // Number of rows
+} pc;
+
+float16_t dot_u32_f16vec4(uint packed, f16vec4 xv) {
+    int ip = int(packed);
+    f16vec4 w = f16vec4(
+        float16_t(bitfieldExtract(ip,  0, 8)),
+        float16_t(bitfieldExtract(ip,  8, 8)),
+        float16_t(bitfieldExtract(ip, 16, 8)),
+        float16_t(bitfieldExtract(ip, 24, 8))
+    );
+    return dot(w, xv);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+
+    float acc = 0.0;
+
+    uint rowOffset = row * pc.K_blocks;
+    for (uint col = laneId; col < pc.K_blocks; col += 32) {
+        uint blockIdx = rowOffset + col;
+        uvec4 w0 = W[blockIdx * 2u + 0u];
+        uvec4 w1 = W[blockIdx * 2u + 1u];
+        float d  = float(scales[blockIdx]);
+
+        uint x_base = col * 8u;
+        float16_t group_dot = dot_u32_f16vec4(w0.x, x[x_base + 0u])
+                            + dot_u32_f16vec4(w0.y, x[x_base + 1u])
+                            + dot_u32_f16vec4(w0.z, x[x_base + 2u])
+                            + dot_u32_f16vec4(w0.w, x[x_base + 3u])
+                            + dot_u32_f16vec4(w1.x, x[x_base + 4u])
+                            + dot_u32_f16vec4(w1.y, x[x_base + 5u])
+                            + dot_u32_f16vec4(w1.z, x[x_base + 6u])
+                            + dot_u32_f16vec4(w1.w, x[x_base + 7u]);
+
+        acc += float(group_dot) * d;
+    }
+
+    float rowSum = subgroupAdd(acc);
+
+    if (laneId == 0) {
+        y[row] = float16_t(rowSum);
+    }
+}
+

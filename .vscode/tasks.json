@@ -2,7 +2,69 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Run GEMV FP16 Benchmark",
+            "label": "Run GGUF Transformer Layer Demo",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/scripts/run_gguf_layer_demo.ps1"
+            ],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "Run RoPE & M=1 Attention Benchmark",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/scripts/run_attention_benchmark.ps1"
+            ],
+            "group": "test",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Run Aux Kernels Benchmark (RMSNorm + SwiGLU)",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/scripts/run_aux_benchmark.ps1"
+            ],
+            "group": "test",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Run GGUF Q4_0 & Group-32 Benchmark",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/scripts/run_gemv_q4_benchmark.ps1"
+            ],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Run GEMV Roofline Benchmark",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -12,10 +74,7 @@
                 "-File",
                 "${workspaceFolder}/scripts/run_gemv_benchmark.ps1"
             ],
-            "group": {
-                "kind": "test",
-                "isDefault": true
-            },
+            "group": "test",
             "problemMatcher": ["$gcc"]
         },
         {

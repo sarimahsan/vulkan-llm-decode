@@ -1,0 +1,67 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// 128 threads = 4 subgroups of 32 threads on Intel Xe-LP
+// 1 workgroup processes 1 row of RMSNorm(x) * gamma
+layout(local_size_x = 128, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[];
+};
+
+layout(set = 0, binding = 1) readonly buffer GammaVector {
+    f16vec4 gamma[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVector {
+    f16vec4 y[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K;      // Hidden dimension (multiple of 4)
+    uint K_vec4; // K / 4
+    float eps;   // Epsilon (e.g. 1e-5 or 1e-6)
+} pc;
+
+shared float sg_sums[4];
+shared float s_inv_rms;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint rowOffset = row * pc.K_vec4;
+
+    // Pass 1: Accumulate sum of squares in FP32 to avoid FP16 overflow
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.K_vec4; i += 128) {
+        vec4 vx = vec4(x[rowOffset + i]);
+        local_sum += dot(vx, vx);
+    }
+
+    // Hardware SIMD32 subgroup reduction, then cross-subgroup sum via shared memory
+    float sg_sum = subgroupAdd(local_sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sg_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (tid == 0) {
+        float total_sum = 0.0;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total_sum += sg_sums[s];
+        }
+        s_inv_rms = inversesqrt(total_sum / float(pc.K) + pc.eps);
+    }
+    barrier();
+
+    // Pass 2: Normalize and scale by gamma
+    float inv_rms = s_inv_rms;
+    for (uint i = tid; i < pc.K_vec4; i += 128) {
+        vec4 vx = vec4(x[rowOffset + i]);
+        vec4 vg = vec4(gamma[i]);
+        y[rowOffset + i] = f16vec4(vx * inv_rms * vg);
+    }
+}
+

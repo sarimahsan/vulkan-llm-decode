@@ -2,7 +2,7 @@
 param (
     [string]$ShaderDir = "",
     [string]$OutputDir = "",
-    [switch]$Disassemble = $true
+    [switch]$Disassemble = $false
 )
 
 $RootDir = Split-Path -Parent $PSScriptRoot

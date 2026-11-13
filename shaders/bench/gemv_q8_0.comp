@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Native GGUF Q8_0 Block definition (34 bytes per 32-weight block, 2-byte aligned)
+struct BlockQ8_0 {
+    float16_t d;     // FP16 scale factor (delta)
+    uint16_t qs[16]; // 16 x uint16 = 32 signed 8-bit weights
+};
+
+// 128 threads per workgroup = 4 subgroups of 32 threads
+// Each subgroup computes 1 output row of GEMV (y = W * x)
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[]; // Vector of length K (stored as f16vec4)
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixGGUF {
+    BlockQ8_0 blocks[]; // Matrix of shape N x (K / 32)
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVector {
+    float16_t y[]; // Output vector of length N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_blocks; // K / 32
+    uint N;        // Number of rows
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+
+    float acc = 0.0;
+
+    uint rowOffset = row * pc.K_blocks;
+    for (uint col = laneId; col < pc.K_blocks; col += 32) {
+        uint blockIdx = rowOffset + col;
+        float d = float(blocks[blockIdx].d);
+        uint x_base = col * 8;
+
+        float16_t group_dot = float16_t(0.0);
+        for (uint g = 0; g < 8; ++g) {
+            int w0 = int(blocks[blockIdx].qs[g * 2 + 0]);
+            int w1 = int(blocks[blockIdx].qs[g * 2 + 1]);
+            f16vec4 w = f16vec4(
+                float16_t(bitfieldExtract(w0, 0, 8)),
+                float16_t(bitfieldExtract(w0, 8, 8)),
+                float16_t(bitfieldExtract(w1, 0, 8)),
+                float16_t(bitfieldExtract(w1, 8, 8))
+            );
+            group_dot += dot(w, x[x_base + g]);
+        }
+
+        acc += float(group_dot) * d;
+    }
+
+    float rowSum = subgroupAdd(acc);
+
+    if (laneId == 0) {
+        y[row] = float16_t(rowSum);
+    }
+}

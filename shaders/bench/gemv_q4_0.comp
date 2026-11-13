@@ -1,0 +1,118 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Native GGUF Q4_0 Block definition (18 bytes per 32-weight block)
+struct BlockQ4_0 {
+    float16_t d;     // FP16 scale factor (delta)
+    uint8_t qs[16];  // 16 bytes = 32 4-bit nibbles (low=0..15, high=16..31)
+};
+
+// 128 threads per workgroup = 4 subgroups of 32 threads
+// Each subgroup computes 1 output row of GEMV (y = W * x)
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[]; // Vector of length K (stored as f16vec4)
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixGGUF {
+    BlockQ4_0 blocks[]; // Matrix of shape N x (K / 32)
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVector {
+    float16_t y[]; // Output vector of length N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_blocks; // K / 32
+    uint N;        // Number of rows
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x; // 0..31
+
+    float16_t acc = float16_t(0.0);
+
+    uint rowOffset = row * pc.K_blocks;
+    for (uint col = laneId; col < pc.K_blocks; col += 32) {
+        uint blockIdx = rowOffset + col;
+        float16_t d = blocks[blockIdx].d;
+
+        uint x_base = col * 8;
+
+        f16vec4 w_low0 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[0]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[1]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[2]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[3]  & 0x0Fu) - 8)
+        );
+        f16vec4 w_low1 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[4]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[5]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[6]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[7]  & 0x0Fu) - 8)
+        );
+        f16vec4 w_low2 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[8]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[9]  & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[10] & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[11] & 0x0Fu) - 8)
+        );
+        f16vec4 w_low3 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[12] & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[13] & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[14] & 0x0Fu) - 8),
+            float16_t(int(blocks[blockIdx].qs[15] & 0x0Fu) - 8)
+        );
+
+        f16vec4 w_high0 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[0]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[1]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[2]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[3]  >> 4u) - 8)
+        );
+        f16vec4 w_high1 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[4]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[5]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[6]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[7]  >> 4u) - 8)
+        );
+        f16vec4 w_high2 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[8]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[9]  >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[10] >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[11] >> 4u) - 8)
+        );
+        f16vec4 w_high3 = f16vec4(
+            float16_t(int(blocks[blockIdx].qs[12] >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[13] >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[14] >> 4u) - 8),
+            float16_t(int(blocks[blockIdx].qs[15] >> 4u) - 8)
+        );
+
+        float16_t group_dot = dot(w_low0,  x[x_base + 0])
+                            + dot(w_low1,  x[x_base + 1])
+                            + dot(w_low2,  x[x_base + 2])
+                            + dot(w_low3,  x[x_base + 3])
+                            + dot(w_high0, x[x_base + 4])
+                            + dot(w_high1, x[x_base + 5])
+                            + dot(w_high2, x[x_base + 6])
+                            + dot(w_high3, x[x_base + 7]);
+
+        acc += group_dot * d;
+    }
+
+    // Hardware SIMD32 Subgroup Reduction
+    float16_t rowSum = subgroupAdd(acc);
+
+    if (laneId == 0) {
+        y[row] = rowSum;
+    }
+}

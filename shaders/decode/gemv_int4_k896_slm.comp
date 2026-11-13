@@ -1,0 +1,81 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Specialized K=896 (28 group-32 blocks) INT4 GEMV with 2 KB SLM input caching.
+// 256 threads per workgroup = 8 subgroups of 32 threads (8 rows/workgroup).
+// Eliminates the dynamic col loop and shrinks SLM from 10 KB to 1.75 KB for higher occupancy.
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector {
+    f16vec4 x[];
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixINT4 {
+    uvec4 W[];
+};
+
+layout(set = 0, binding = 2) readonly buffer ScaleMatrix {
+    float16_t scales[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputVector {
+    float16_t y[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_group32; // 28 for K = 896
+    uint N;         // Number of rows
+} pc;
+
+shared f16vec4 s_x[224]; // 896 / 4 = 224 f16vec4s = 1.75 KB SLM
+
+void main() {
+    uint tid = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x;
+    if (tid < 224u) {
+        s_x[tid] = x[tid];
+    }
+    barrier();
+
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x;
+    float16_t acc = float16_t(0.0);
+
+    if (laneId < 28u) {
+        uint blockIdx = row * 28u + laneId;
+        uvec4 packed_w = W[blockIdx];
+        float16_t d = scales[blockIdx];
+
+        uint x_base = laneId * 8u;
+        float16_t group_dot = float16_t(0.0);
+
+        for (uint c = 0u; c < 4u; ++c) {
+            uint word = packed_w[c];
+            f16vec4 w0 = f16vec4(
+                float16_t(bitfieldExtract(word,  0, 4)),
+                float16_t(bitfieldExtract(word,  4, 4)),
+                float16_t(bitfieldExtract(word,  8, 4)),
+                float16_t(bitfieldExtract(word, 12, 4))
+            ) - float16_t(8.0);
+            f16vec4 w1 = f16vec4(
+                float16_t(bitfieldExtract(word, 16, 4)),
+                float16_t(bitfieldExtract(word, 20, 4)),
+                float16_t(bitfieldExtract(word, 24, 4)),
+                float16_t(bitfieldExtract(word, 28, 4))
+            ) - float16_t(8.0);
+            group_dot += dot(w0, s_x[x_base + c * 2u + 0u])
+                       + dot(w1, s_x[x_base + c * 2u + 1u]);
+        }
+
+        acc = group_dot * d;
+    }
+
+    float16_t rowSum = subgroupAdd(acc);
+    if (laneId == 0u) {
+        y[row] = rowSum;
+    }
+}
+

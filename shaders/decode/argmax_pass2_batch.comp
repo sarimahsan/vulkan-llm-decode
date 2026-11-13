@@ -1,0 +1,56 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// Batched Pass 2 of 2-pass parallel greedy argmax (dispatch 1, M, 1)
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer PartialVals { float partial_vals[]; };
+layout(set = 0, binding = 1) readonly buffer PartialIdxs { uint partial_idxs[]; };
+layout(set = 0, binding = 2) writeonly buffer OutToken { uint out_token[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N_wg;
+} pc;
+
+shared float s_vals[8];
+shared uint  s_idxs[8];
+
+void main() {
+    uint m = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = m * pc.N_wg;
+    float best_val = -1e30;
+    uint  best_idx = 0u;
+
+    for (uint i = tid; i < pc.N_wg; i += 256u) {
+        float v = partial_vals[base + i];
+        if (v > best_val) {
+            best_val = v;
+            best_idx = partial_idxs[base + i];
+        }
+    }
+
+    float sg_max = subgroupMax(best_val);
+    uvec4 mask = subgroupBallot(best_val == sg_max);
+    uint winner_lane = subgroupBallotFindLSB(mask);
+    if (gl_SubgroupInvocationID == winner_lane) {
+        s_vals[gl_SubgroupID] = best_val;
+        s_idxs[gl_SubgroupID] = best_idx;
+    }
+
+    barrier();
+
+    if (tid == 0u) {
+        float final_val = -1e30;
+        uint  final_idx = 0u;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            if (s_vals[s] > final_val) {
+                final_val = s_vals[s];
+                final_idx = s_idxs[s];
+            }
+        }
+        out_token[m] = final_idx;
+    }
+}
+

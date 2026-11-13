@@ -34,13 +34,20 @@ $$\text{Roofline Ceiling} \approx \frac{16.28\text{ GB/s}}{0.295\text{ GB}} \app
 ## 📁 Repository Structure
 ```
 vulkan-llm-decode/
-├── .vscode/        # VS Code tasks and shader language configurations
-├── bin/            # Compiled benchmark executables (git-ignored)
-├── libs/           # Windows CRT import libraries (kernel32.lib, msvcrt.lib)
-├── scripts/        # PowerShell automation & benchmark build scripts
-├── shaders/        # GLSL compute kernels (FP16, INT8 DP4A, INT4 fused GEMV)
-├── spirv/          # Compiled SPIR-V bytecode & assembly (.spvasm)
-├── src/            # Host benchmark & inference runtime (C / Vulkan)
+├── .vscode/            # VS Code tasks and shader language configurations
+├── bin/                # Compiled executables (git-ignored)
+├── libs/               # Windows CRT import libraries (kernel32.lib, msvcrt.lib)
+├── models/             # GGUF model files (git-ignored)
+├── scripts/            # PowerShell build, shader compilation & benchmark scripts
+│   └── build_qwen_decode.ps1
+├── shaders/
+│   ├── decode/         # Active Qwen2.5 decode & speculative batch compute shaders (21)
+│   └── bench/          # Phase 1-6 microbenchmark compute shaders (13)
+├── spirv/              # Compiled SPIR-V bytecode (git-ignored)
+├── src/
+│   ├── engine/         # Core Vulkan LLM decode runtime (qwen_decode.c, gguf.h)
+│   └── benchmarks/     # Standalone phase benchmarks & GGUF inspection tools
+├── tools/              # External baseline binaries such as llama.cpp (git-ignored)
 ├── .gitignore
 └── README.md
 ```
@@ -49,20 +56,72 @@ vulkan-llm-decode/
 
 ## 🚀 Quick Start
 
-### 1. Compile Shaders
+### 1. Build & Run Full Qwen2.5-0.5B-Instruct Decode Engine
+Compiles all 34 compute shaders, builds `bin/qwen_decode.exe`, and runs a 160-token decode:
+```powershell
+.\scripts\build_qwen_decode.ps1 -Run
+```
+
+### 2. Compile Shaders Only
 ```powershell
 .\scripts\compile_shaders.ps1
 ```
 
-### 2. Run Memory Bandwidth Benchmark
+### 3. Run Standalone Microbenchmarks
 ```powershell
 .\scripts\run_bandwidth_test.ps1
+.\scripts\run_gemv_benchmark.ps1
+.\scripts\run_gemv_q4_benchmark.ps1
 ```
 
-### 3. Run Subgroup FP16 GEMV Benchmark
-```powershell
-.\scripts\run_gemv_benchmark.ps1
+---
+
+## 🏆 End-to-End Inference Results: Qwen2.5-0.5B-Instruct (`Q4_0`)
+
+Measured on **Intel(R) UHD Graphics (Xe-LP)** generating **160 tokens** (greedy decode with self-speculative drafting & batched verification), averaged across **5 consecutive runs (`mean ± stddev`)**:
+
+| Engine / Backend | Mode | Throughput (`tg160`) | Notes |
+|:---|:---:|:---:|:---|
+| **vulkan-llm-decode (`qwen_decode.exe`)** | **GPU-Only (Vulkan)** | **54.54 ± 3.33 tok/s** | Pure GPU timestamp decode (peak `59.97 tok/s`) |
+| **vulkan-llm-decode (`qwen_decode.exe`)** | **Wall-Clock (Vulkan)** | **53.15 ± 3.37 tok/s** | End-to-end host wall-clock (peak `58.36 tok/s`) |
+| `llama.cpp` (`llama-bench`, `ngl=99`) | Vulkan iGPU | 48.29 ± 1.95 tok/s | Baseline (`build 2d8a32502 (12360)`) |
+| `llama.cpp` (`llama-bench`, `ngl=0`) | CPU-Only | 50.73 ± 1.32 tok/s | Baseline (`build 2d8a32502 (12360)`) |
+
+### Key Engine Achievements
+* **+12.9% faster GPU decode** (`54.54 ± 3.33 tok/s` GPU-only / `53.15 ± 3.37 tok/s` wall-clock) than `llama.cpp` Vulkan (`48.29 ± 1.95 tok/s`), and **+4.8% faster wall-clock** than `llama.cpp` CPU (`50.73 ± 1.32 tok/s`) on the same Intel UHD Graphics system.
+* **Custom End-to-End Vulkan Runtime (`src/engine/qwen_decode.c`):** Direct GGUF loading (`src/engine/gguf.h`), fused SLM Q4_0 dequant-GEMV and fused SwiGLU kernels, dynamic RoPE, KV-cache append, grouped-query attention decode, and 2-pass GPU argmax.
+* **Self-Speculative Batched Decode:** Integrated batched `GEMM`/`attention` verification (`147 steps | drafted=55, accepted=12 (21.8% accept, 1.08 tok/step)`).
+* **Per-Step GPU Breakdown (single-run profile, `17.579 ms` total GPU):** `L0 = 0.670 ms` | `24 Layers = 13.809 ms` | `Head = 3.769 ms`.
+
+### Decode Pipeline Architecture
+```mermaid
+flowchart LR
+    D["draft_ngram (1-4 tokens)"] --> N1["Residual + RMSNorm"]
+    subgraph L["24 Transformer Layers (GPU)"]
+        direction LR
+        N1 --> QKV["SLM Q4_0 QKV GEMV/GEMM"]
+        QKV --> ATTN["RoPE + KV Append + GQA"]
+        ATTN --> OP["SLM Q4_0 O-Proj + RMSNorm"]
+        OP --> FFN["Fused Q4_0 SwiGLU + Down"]
+    end
+    FFN --> HEAD["LM Head + 2-Pass GPU Argmax"]
+    HEAD -->|"Accept / Next Step"| D
 ```
+
+---
+
+## 📈 Benchmark Results: Grouped Quantization & GGUF Q4_0 ($y = W \cdot x$)
+
+Measured on **Intel(R) UHD Graphics (Xe-LP / SIMD32 Subgroups)** against the measured **16.28 GB/s** physical DRAM bus roofline:
+
+### Full DRAM Bus Saturation ($8192 \times 8192$, 0.134 GFLOPs)
+| Quantization Format | Storage Layout | Footprint | Bits/Param | Latency | Achieved Bandwidth | % DRAM Roofline | Throughput | Verification |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **FP16 Baseline** | Dense FP16 | 128.00 MB | 16.0 | **8.627 ms** | **15.56 GB/s** | 95.6% | 115.9 inf/s | **PASSED (0.0000)** |
+| **INT8 Fused Dequant** | Dense INT8 + row scale | 64.00 MB | 8.0 | **4.522 ms** (1.91×) | **14.85 GB/s** | 91.2% | 221.1 inf/s | **PASSED (0.0000)** |
+| **INT4 Per-Row** | Packed INT4 + row scale | 32.00 MB | 4.0 | **2.173 ms** (3.97×) | **15.46 GB/s** | 95.0% | 460.3 inf/s | **PASSED (0.0000)** |
+| **Group-32 Linear (AWQ)** | Split `uvec4` weights + FP16 scales | 36.00 MB | **4.5** | **2.431 ms** (**3.55×**) | **15.54 GB/s** | **95.5%** | **411.4 inf/s** | **PASSED (0.0000)** |
+| **Native GGUF Q4_0** | Interleaved 18-byte `block_q4_0` | 36.00 MB | **4.5** | **2.484 ms** (**3.47×**) | **15.21 GB/s** | **93.4%** | **402.5 inf/s** | **PASSED (0.0000)** |
 
 ---
 

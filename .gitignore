@@ -2,6 +2,9 @@
 build/
 bin/
 out/
+spirv/
+models/*.gguf
+tools/
 *.exe
 *.obj
 *.pdb

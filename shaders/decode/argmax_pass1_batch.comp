@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// Batched Pass 1 of 2-pass parallel greedy argmax (dispatch ARGMAX_WG, M, 1)
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Logits { float16_t logits[]; };
+layout(set = 0, binding = 1) writeonly buffer PartialVals { float partial_vals[]; };
+layout(set = 0, binding = 2) writeonly buffer PartialIdxs { uint partial_idxs[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N; // vocab_size
+} pc;
+
+shared float s_vals[8];
+shared uint  s_idxs[8];
+
+void main() {
+    uint m = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uint logit_base = m * pc.N;
+    float best_val = -1e30;
+    uint  best_idx = 0u;
+
+    for (uint i = gl_GlobalInvocationID.x; i < pc.N; i += stride) {
+        float v = float(logits[logit_base + i]);
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    float sg_max = subgroupMax(best_val);
+    uvec4 mask = subgroupBallot(best_val == sg_max);
+    uint winner_lane = subgroupBallotFindLSB(mask);
+    if (gl_SubgroupInvocationID == winner_lane) {
+        s_vals[gl_SubgroupID] = best_val;
+        s_idxs[gl_SubgroupID] = best_idx;
+    }
+
+    barrier();
+
+    if (tid == 0u) {
+        float final_val = -1e30;
+        uint  final_idx = 0u;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            if (s_vals[s] > final_val) {
+                final_val = s_vals[s];
+                final_idx = s_idxs[s];
+            }
+        }
+        uint out_idx = m * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        partial_vals[out_idx] = final_val;
+        partial_idxs[out_idx] = final_idx;
+    }
+}
+

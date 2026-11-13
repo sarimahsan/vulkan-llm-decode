@@ -1,0 +1,77 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused Residual Add + RMSNorm:
+//   res_out  = a + b
+//   norm_out = RMSNorm(res_out) * gamma
+// Eliminates 1 dispatch + 1 pipeline barrier per fusion point (48 per token across 24 layers).
+layout(local_size_x = 128, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer VecA {
+    f16vec4 a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer VecB {
+    f16vec4 b[];
+};
+
+layout(set = 0, binding = 2) readonly buffer GammaVector {
+    f16vec4 gamma[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer ResOut {
+    f16vec4 res_out[];
+};
+
+layout(set = 0, binding = 4) writeonly buffer NormOut {
+    f16vec4 norm_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K;      // Hidden dimension (multiple of 4)
+    uint K_vec4; // K / 4
+    float eps;   // Epsilon (e.g. 1e-6)
+} pc;
+
+shared float sg_sums[4];
+shared float s_inv_rms;
+shared vec4  s_x[256]; // Up to K_vec4 = 256 (K = 1024) kept in SLM
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.K_vec4; i += 128u) {
+        vec4 vx = vec4(a[i]) + vec4(b[i]);
+        res_out[i] = f16vec4(vx);
+        if (i < 256u) {
+            s_x[i] = vx;
+        }
+        local_sum += dot(vx, vx);
+    }
+
+    float sg_sum = subgroupAdd(local_sum);
+    if (gl_SubgroupInvocationID == 0u) {
+        sg_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total_sum = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total_sum += sg_sums[s];
+        }
+        s_inv_rms = inversesqrt(total_sum / float(pc.K) + pc.eps);
+    }
+    barrier();
+
+    float inv_rms = s_inv_rms;
+    for (uint i = tid; i < pc.K_vec4; i += 128u) {
+        vec4 vx = (i < 256u) ? s_x[i] : (vec4(a[i]) + vec4(b[i]));
+        vec4 vg = vec4(gamma[i]);
+        norm_out[i] = f16vec4(vx * inv_rms * vg);
+    }
+}
+
