@@ -11,6 +11,8 @@ tools/
 *.ilk
 *.lib
 !libs/*.lib
+RESEARCH_QA.md
+PROJECT_STATUS.md
 
 # VS Code / IDE
 .vs/
@@ -19,3 +21,4 @@ tools/
 !.vscode/settings.json
 !.vscode/extensions.json
 
+vulkan-llm-decode-video/

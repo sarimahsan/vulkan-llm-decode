@@ -3,6 +3,8 @@
 > **Bandwidth-Roofline LLM Decode Engine on Vulkan**  
 > Fused INT4/INT8 dequant-GEMV kernels for LLM decoding on bandwidth-constrained Intel Xe-LP (UHD Graphics) architectures.
 
+<video src="assets/vulkan-llm-decode.mp4" controls muted playsinline width="100%" autoplay></video>
+
 ---
 
 ## 🎯 Research Motivation & Goals
@@ -28,29 +30,6 @@ $$\text{Roofline Ceiling} \approx \frac{16.28\text{ GB/s}}{0.295\text{ GB}} \app
 * **Hardware Timestamp Resolution:** 52.0833 ns (`vkCmdWriteTimestamp`)
 * **Real Peak Copy Bandwidth:** **14.64 GB/s** (128 MB working set)
 * **Real Peak Vector-Add Bandwidth:** **16.28 GB/s** (192 MB working set)
-
----
-
-## 📁 Repository Structure
-```
-vulkan-llm-decode/
-├── .vscode/            # VS Code tasks and shader language configurations
-├── bin/                # Compiled executables (git-ignored)
-├── libs/               # Windows CRT import libraries (kernel32.lib, msvcrt.lib)
-├── models/             # GGUF model files (git-ignored)
-├── scripts/            # PowerShell build, shader compilation & benchmark scripts
-│   └── build_qwen_decode.ps1
-├── shaders/
-│   ├── decode/         # Active Qwen2.5 decode & speculative batch compute shaders (21)
-│   └── bench/          # Phase 1-6 microbenchmark compute shaders (13)
-├── spirv/              # Compiled SPIR-V bytecode (git-ignored)
-├── src/
-│   ├── engine/         # Core Vulkan LLM decode runtime (qwen_decode.c, gguf.h)
-│   └── benchmarks/     # Standalone phase benchmarks & GGUF inspection tools
-├── tools/              # External baseline binaries such as llama.cpp (git-ignored)
-├── .gitignore
-└── README.md
-```
 
 ---
 
@@ -142,6 +121,18 @@ Measured on **Intel(R) UHD Graphics (Xe-LP / SIMD32 Subgroups)** against the mea
 | **FP16 Baseline** | 32.00 MB | 2.745 ms | 364.3 inf/s | **PASSED (0.0000)** |
 | **INT8 Fused Dequant** | 16.00 MB | 1.296 ms (2.12× speedup) | 771.5 inf/s | **PASSED (0.0000)** |
 | **INT4 Fused Dequant** | 8.00 MB | 1.868 ms | 535.2 inf/s | **PASSED (0.0000)** |
+
+---
+
+## 🧪 Ablation Studies (`8192 × 8192`, `scripts/run_ablation_benchmark.ps1`)
+
+Averaged across **5 consecutive runs (`mean ± stddev`)** on **Intel(R) UHD Graphics** (see [RESEARCH_QA.md](RESEARCH_QA.md) for full analysis):
+
+| Ablation | Variant A (`mean ± stddev`) | Variant B (`mean ± stddev`) | Comparison | Architectural Takeaway |
+|:---|:---:|:---:|:---:|:---|
+| **RQ #2: Fusion Impact (INT4)** | Fused (`3.540 ± 1.635 ms`, med `2.713 ms`) | Unfused 2-pass `INT4→FP16` (`30.770 ± 1.147 ms`) | **8.69× mean / 11.34× median slower unfused** | Unfused dequant writes `128 MB` FP16 + barrier + reads `128 MB` (`288 MB` total vs `32 MB` fused) |
+| **RQ #3a: Subgroup Reduction (INT4)** | `SIMD32 subgroupAdd` (`3.540 ± 1.635 ms`, min `2.308 ms`) | SLM tree reduction (`2.418 ± 0.127 ms`, min `2.295 ms`) | **Best-case parity** (`2.308` vs `2.295 ms`) | Reduction runs once per row after `32 MB` DRAM streaming; `subgroupAdd` had one Run-4 OS spike (`6.727 ms`) |
+| **RQ #3b: Hardware DP4A (INT8)** | FP16 unpack + `dot` (`4.041 ± 0.074 ms`) | `dotPacked4x8EXT` DP4A (`4.085 ± 0.129 ms`) | **Indistinguishable within 1σ** | Both stream `64 MB` INT8 from DRAM; DP4A ALU savings are hidden behind the `16.28 GB/s` memory wall |
 
 ---
 

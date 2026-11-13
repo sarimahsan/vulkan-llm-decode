@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Ablation: INT8 GEMV using hardware DP4A (dotPacked4x8EXT) + subgroupAdd
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVectorINT8 {
+    uvec4 x_q[]; // Packed int8x4 x 4 = 16 int8 elements per uvec4
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightMatrixINT8 {
+    uvec4 W[]; // N x (K / 16)
+};
+
+layout(set = 0, binding = 2) readonly buffer ScaleVector {
+    float16_t scales[]; // N
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputVector {
+    float16_t y[]; // N
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_uvec4; // K / 16
+    uint N;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x;
+    int acc = 0;
+
+    uint rowOffset = row * pc.K_uvec4;
+    for (uint col = laneId; col < pc.K_uvec4; col += 32) {
+        uvec4 w_q = W[rowOffset + col];
+        uvec4 xv  = x_q[col];
+
+        acc += dotPacked4x8EXT(int(w_q.x), int(xv.x));
+        acc += dotPacked4x8EXT(int(w_q.y), int(xv.y));
+        acc += dotPacked4x8EXT(int(w_q.z), int(xv.z));
+        acc += dotPacked4x8EXT(int(w_q.w), int(xv.w));
+    }
+
+    int rowSum = subgroupAdd(acc);
+
+    if (laneId == 0) {
+        y[row] = float16_t(float(rowSum) * float(scales[row]));
+    }
+}

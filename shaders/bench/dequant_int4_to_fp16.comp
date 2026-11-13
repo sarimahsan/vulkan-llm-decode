@@ -1,0 +1,87 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Unfused Pass 1: Dequantize packed INT4 (uvec4 = 32 weights) -> FP16 matrix (f16vec4) in DRAM
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightMatrixINT4 {
+    uvec4 W_in[]; // N x (K / 32)
+};
+
+layout(set = 0, binding = 1) readonly buffer ScaleVector {
+    float16_t scales[]; // N
+};
+
+layout(set = 0, binding = 2) writeonly buffer WeightMatrixFP16 {
+    f16vec4 W_out[]; // N x (K / 4)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint K_uvec4; // K / 32
+    uint N;       // Number of rows
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x;
+    float16_t s = scales[row];
+    uint inOffset = row * pc.K_uvec4;
+    uint outOffset = row * (pc.K_uvec4 * 8);
+
+    for (uint col = laneId; col < pc.K_uvec4; col += 32) {
+        uvec4 packed_w = W_in[inOffset + col];
+        uint o = outOffset + col * 8;
+
+        W_out[o + 0] = f16vec4(
+            float16_t(int(packed_w.x & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.x >> 4u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.x >> 8u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.x >> 12u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 1] = f16vec4(
+            float16_t(int((packed_w.x >> 16u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.x >> 20u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.x >> 24u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.x >> 28u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 2] = f16vec4(
+            float16_t(int(packed_w.y & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.y >> 4u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.y >> 8u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.y >> 12u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 3] = f16vec4(
+            float16_t(int((packed_w.y >> 16u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.y >> 20u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.y >> 24u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.y >> 28u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 4] = f16vec4(
+            float16_t(int(packed_w.z & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.z >> 4u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.z >> 8u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.z >> 12u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 5] = f16vec4(
+            float16_t(int((packed_w.z >> 16u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.z >> 20u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.z >> 24u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.z >> 28u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 6] = f16vec4(
+            float16_t(int(packed_w.w & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.w >> 4u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.w >> 8u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.w >> 12u) & 0x0Fu) - 8) * s
+        );
+        W_out[o + 7] = f16vec4(
+            float16_t(int((packed_w.w >> 16u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.w >> 20u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.w >> 24u) & 0x0Fu) - 8) * s,
+            float16_t(int((packed_w.w >> 28u) & 0x0Fu) - 8) * s
+        );
+    }
+}
+
