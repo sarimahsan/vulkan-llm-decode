@@ -668,6 +668,170 @@ int mainCRTStartup() {
     vkDestroyDescriptorSetLayout(device, addDsl, NULL);
   }
 
+  // ========================================================================
+  // TEST 3: PURE STREAMING READ (~300 MB buffer)
+  // ========================================================================
+  {
+    puts("[Running Benchmark 3/3: Pure Streaming Read (300 MB)]");
+
+    const uint32_t readElems = 19660800u; // 300.00 MB (16 bytes * 19,660,800)
+    const VkDeviceSize readBytes = (VkDeviceSize)readElems * 16u;
+    const uint32_t readGroups = (readElems + elementsPerGroup - 1u) / elementsPerGroup;
+
+    VkBuffer bufRead;
+    VkDeviceMemory memRead;
+    createBuffer(device, physDev, readBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 memFlags, &bufRead, &memRead);
+    uint32_t *ptrRead = NULL;
+    VK_CHECK(vkMapMemory(device, memRead, 0, readBytes, 0, (void **)&ptrRead));
+    for (size_t i = 0; i < (size_t)readElems * 4; i += 1024)
+      ptrRead[i] = (uint32_t)i;
+    vkUnmapMemory(device, memRead);
+
+    VkDescriptorSetLayoutBinding readBindings[2] = {0};
+    readBindings[0].binding = 0;
+    readBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    readBindings[0].descriptorCount = 1;
+    readBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    readBindings[1].binding = 1;
+    readBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    readBindings[1].descriptorCount = 1;
+    readBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo readDslInfo = {0};
+    readDslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    readDslInfo.bindingCount = 2;
+    readDslInfo.pBindings = readBindings;
+    VkDescriptorSetLayout readDsl;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &readDslInfo, NULL, &readDsl));
+
+    VkPushConstantRange pcRange = {0};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(uint32_t);
+
+    VkPipelineLayoutCreateInfo readPlInfo = {0};
+    readPlInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    readPlInfo.setLayoutCount = 1;
+    readPlInfo.pSetLayouts = &readDsl;
+    readPlInfo.pushConstantRangeCount = 1;
+    readPlInfo.pPushConstantRanges = &pcRange;
+    VkPipelineLayout readPipelineLayout;
+    VK_CHECK(vkCreatePipelineLayout(device, &readPlInfo, NULL,
+                                    &readPipelineLayout));
+
+    size_t spvSize = 0;
+    uint32_t *spvCode = readSpirvFile("spirv/read_bandwidth.spv", &spvSize);
+    VkShaderModuleCreateInfo smInfo = {0};
+    smInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smInfo.codeSize = spvSize;
+    smInfo.pCode = spvCode;
+    VkShaderModule readModule;
+    VK_CHECK(vkCreateShaderModule(device, &smInfo, NULL, &readModule));
+    free(spvCode);
+
+    VkComputePipelineCreateInfo cpPipeInfo = {0};
+    cpPipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpPipeInfo.layout = readPipelineLayout;
+    cpPipeInfo.stage.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpPipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpPipeInfo.stage.module = readModule;
+    cpPipeInfo.stage.pName = "main";
+    VkPipeline readPipeline;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpPipeInfo,
+                                      NULL, &readPipeline));
+
+    VkDescriptorSetAllocateInfo dsAlloc = {0};
+    dsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsAlloc.descriptorPool = descPool;
+    dsAlloc.descriptorSetCount = 1;
+    dsAlloc.pSetLayouts = &readDsl;
+    VkDescriptorSet readDescSet;
+    VK_CHECK(vkAllocateDescriptorSets(device, &dsAlloc, &readDescSet));
+
+    VkDescriptorBufferInfo bufInfoR = {bufRead, 0, readBytes};
+    VkDescriptorBufferInfo bufInfoSink = {bufC, 0, 64};
+    VkWriteDescriptorSet readWrites[2] = {0};
+    readWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    readWrites[0].dstSet = readDescSet;
+    readWrites[0].dstBinding = 0;
+    readWrites[0].descriptorCount = 1;
+    readWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    readWrites[0].pBufferInfo = &bufInfoR;
+    readWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    readWrites[1].dstSet = readDescSet;
+    readWrites[1].dstBinding = 1;
+    readWrites[1].descriptorCount = 1;
+    readWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    readWrites[1].pBufferInfo = &bufInfoSink;
+    vkUpdateDescriptorSets(device, 2, readWrites, 0, NULL);
+
+    double bestGpuTimeMs = 1e9;
+    double totalGpuTimeMs = 0.0;
+    const int iterations = 10;
+
+    for (int iter = -2; iter < iterations; ++iter) {
+      VK_CHECK(vkResetCommandBuffer(cmd, 0));
+      VkCommandBufferBeginInfo beginInfo = {0};
+      beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+      vkCmdResetQueryPool(cmd, queryPool, 0, 2);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, readPipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              readPipelineLayout, 0, 1, &readDescSet, 0, NULL);
+      vkCmdPushConstants(cmd, readPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(uint32_t), &readElems);
+      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
+      vkCmdDispatch(cmd, readGroups, 1, 1);
+      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool,
+                          1);
+      VK_CHECK(vkEndCommandBuffer(cmd));
+
+      VkSubmitInfo submitInfo = {0};
+      submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      submitInfo.commandBufferCount = 1;
+      submitInfo.pCommandBuffers = &cmd;
+      VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
+      VK_CHECK(vkQueueWaitIdle(queue));
+
+      if (iter < 0)
+        continue;
+      uint64_t timestamps[2] = {0, 0};
+      VK_CHECK(vkGetQueryPoolResults(
+          device, queryPool, 0, 2, sizeof(timestamps), timestamps,
+          sizeof(uint64_t),
+          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+      double timeMs = (double)(timestamps[1] - timestamps[0]) *
+                      (double)props.limits.timestampPeriod / 1.0e6;
+      if (timeMs < bestGpuTimeMs)
+        bestGpuTimeMs = timeMs;
+      totalGpuTimeMs += timeMs;
+    }
+
+    double avgGpuTimeMs = totalGpuTimeMs / iterations;
+    double peakBandwidthGBs =
+        ((double)readBytes / (bestGpuTimeMs / 1000.0)) / 1.0e9;
+    double avgBandwidthGBs =
+        ((double)readBytes / (avgGpuTimeMs / 1000.0)) / 1.0e9;
+
+    printf("  Bytes Transferred:   %.2f MB (Pure Streaming Read)\n",
+           (double)readBytes / (1024.0 * 1024.0));
+    printf("  Best GPU Kernel:     %.3f ms\n", bestGpuTimeMs);
+    printf("  Average GPU Kernel:  %.3f ms\n", avgGpuTimeMs);
+    printf("  >> REAL PEAK READ BANDWIDTH:  %.2f GB/s\n", peakBandwidthGBs);
+    printf("  >> AVERAGE READ BANDWIDTH:    %.2f GB/s\n", avgBandwidthGBs);
+    puts("====================================================================="
+         "===========");
+
+    vkDestroyPipeline(device, readPipeline, NULL);
+    vkDestroyPipelineLayout(device, readPipelineLayout, NULL);
+    vkDestroyShaderModule(device, readModule, NULL);
+    vkDestroyDescriptorSetLayout(device, readDsl, NULL);
+    vkDestroyBuffer(device, bufRead, NULL);
+    vkFreeMemory(device, memRead, NULL);
+  }
+
   // Cleanup resources
   vkDestroyDescriptorPool(device, descPool, NULL);
   vkDestroyCommandPool(device, cmdPool, NULL);

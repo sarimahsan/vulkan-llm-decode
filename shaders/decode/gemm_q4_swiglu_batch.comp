@@ -20,6 +20,8 @@ layout(push_constant) uniform PushConstants {
     uint M;         // Batch size (1..4)
 } pc;
 
+layout(constant_id = 0) const uint SCALE_SHIFT = 0u;
+
 shared f16vec4 s_x[4][224];
 
 void main() {
@@ -46,8 +48,8 @@ void main() {
         uint blockIdx = row * 28u + laneId;
         uvec4 pg = W_gate[blockIdx];
         uvec4 pu = W_up[blockIdx];
-        float16_t dg = S_gate[blockIdx];
-        float16_t du = S_up[blockIdx];
+        float16_t dg = S_gate[blockIdx >> SCALE_SHIFT];
+        float16_t du = S_up[blockIdx >> SCALE_SHIFT];
         uint x_base = laneId * 8u;
 
         for (uint c = 0u; c < 4u; ++c) {

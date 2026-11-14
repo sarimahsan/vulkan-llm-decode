@@ -1,0 +1,121 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused Gate + Up Group-128 3-bit GEMV + SwiGLU Activation with SLM input x caching.
+// 32 weights packed in 3 uint32s (12 bytes) + 1 FP16 scale per 128 weights (3.125 bpw).
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer InputVector  { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer GateWeights  { uint W_gate[]; };
+layout(set = 0, binding = 2) readonly buffer GateScales   { float16_t S_gate[]; };
+layout(set = 0, binding = 3) readonly buffer UpWeights    { uint W_up[]; };
+layout(set = 0, binding = 4) readonly buffer UpScales     { float16_t S_up[]; };
+layout(set = 0, binding = 5) writeonly buffer OutputVector { float16_t y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint K_group32; // K / 32
+    uint N;         // Intermediate size (I)
+} pc;
+
+shared f16vec4 s_x[256];
+
+float16_t dot32_q3(uint u0, uint u1, uint u2, uint xb) {
+    float16_t acc = float16_t(0.0);
+    f16vec4 w0 = f16vec4(
+        float16_t(int((u0 >>  0u) & 7u) - 4),
+        float16_t(int((u0 >>  3u) & 7u) - 4),
+        float16_t(int((u0 >>  6u) & 7u) - 4),
+        float16_t(int((u0 >>  9u) & 7u) - 4)
+    );
+    f16vec4 w1 = f16vec4(
+        float16_t(int((u0 >> 12u) & 7u) - 4),
+        float16_t(int((u0 >> 15u) & 7u) - 4),
+        float16_t(int((u0 >> 18u) & 7u) - 4),
+        float16_t(int((u0 >> 21u) & 7u) - 4)
+    );
+    acc += dot(w0, s_x[xb + 0u]) + dot(w1, s_x[xb + 1u]);
+
+    f16vec4 w2 = f16vec4(
+        float16_t(int((u0 >> 24u) & 7u) - 4),
+        float16_t(int((u0 >> 27u) & 7u) - 4),
+        float16_t(int((u1 >>  0u) & 7u) - 4),
+        float16_t(int((u1 >>  3u) & 7u) - 4)
+    );
+    f16vec4 w3 = f16vec4(
+        float16_t(int((u1 >>  6u) & 7u) - 4),
+        float16_t(int((u1 >>  9u) & 7u) - 4),
+        float16_t(int((u1 >> 12u) & 7u) - 4),
+        float16_t(int((u1 >> 15u) & 7u) - 4)
+    );
+    acc += dot(w2, s_x[xb + 2u]) + dot(w3, s_x[xb + 3u]);
+
+    f16vec4 w4 = f16vec4(
+        float16_t(int((u1 >> 18u) & 7u) - 4),
+        float16_t(int((u1 >> 21u) & 7u) - 4),
+        float16_t(int((u1 >> 24u) & 7u) - 4),
+        float16_t(int((u1 >> 27u) & 7u) - 4)
+    );
+    f16vec4 w5 = f16vec4(
+        float16_t(int((u2 >>  0u) & 7u) - 4),
+        float16_t(int((u2 >>  3u) & 7u) - 4),
+        float16_t(int((u2 >>  6u) & 7u) - 4),
+        float16_t(int((u2 >>  9u) & 7u) - 4)
+    );
+    acc += dot(w4, s_x[xb + 4u]) + dot(w5, s_x[xb + 5u]);
+
+    f16vec4 w6 = f16vec4(
+        float16_t(int((u2 >> 12u) & 7u) - 4),
+        float16_t(int((u2 >> 15u) & 7u) - 4),
+        float16_t(int((u2 >> 18u) & 7u) - 4),
+        float16_t(int((u2 >> 21u) & 7u) - 4)
+    );
+    uint q30 = (u0 >> 30u) | ((u2 >> 28u) & 4u);
+    uint q31 = (u1 >> 30u) | ((u2 >> 29u) & 4u);
+    f16vec4 w7 = f16vec4(
+        float16_t(int((u2 >> 24u) & 7u) - 4),
+        float16_t(int((u2 >> 27u) & 7u) - 4),
+        float16_t(int(q30) - 4),
+        float16_t(int(q31) - 4)
+    );
+    acc += dot(w6, s_x[xb + 6u]) + dot(w7, s_x[xb + 7u]);
+    return acc;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x;
+    uint K_vec4 = pc.K_group32 * 8u;
+    for (uint i = tid; i < K_vec4; i += 256u) {
+        s_x[i] = x[i];
+    }
+    barrier();
+
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x;
+    float16_t acc_g = float16_t(0.0);
+    float16_t acc_u = float16_t(0.0);
+
+    uint rowOffset = row * pc.K_group32;
+    for (uint col = laneId; col < pc.K_group32; col += 32u) {
+        uint blockIdx = rowOffset + col;
+        uint wIdx = blockIdx * 3u;
+        float16_t dg = S_gate[blockIdx >> 2u];
+        float16_t du = S_up[blockIdx >> 2u];
+        uint xb = col * 8u;
+
+        acc_g += dot32_q3(W_gate[wIdx + 0u], W_gate[wIdx + 1u], W_gate[wIdx + 2u], xb) * dg;
+        acc_u += dot32_q3(W_up[wIdx + 0u],   W_up[wIdx + 1u],   W_up[wIdx + 2u],   xb) * du;
+    }
+
+    float16_t g_val = subgroupAdd(acc_g);
+    float16_t u_val = subgroupAdd(acc_u);
+
+    if (laneId == 0u) {
+        float gf = float(g_val);
+        float silu = gf / (1.0 + exp(-gf));
+        y[row] = float16_t(silu * float(u_val));
+    }
+}

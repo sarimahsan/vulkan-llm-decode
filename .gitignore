@@ -13,6 +13,7 @@ tools/
 !libs/*.lib
 RESEARCH_QA.md
 PROJECT_STATUS.md
+GLSL_GUIDE.md
 
 # VS Code / IDE
 .vs/

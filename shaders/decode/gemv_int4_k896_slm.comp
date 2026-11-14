@@ -29,6 +29,8 @@ layout(push_constant) uniform PushConstants {
     uint N;         // Number of rows
 } pc;
 
+layout(constant_id = 0) const uint SCALE_SHIFT = 0u;
+
 shared f16vec4 s_x[224]; // 896 / 4 = 224 f16vec4s = 1.75 KB SLM
 
 void main() {
@@ -47,7 +49,7 @@ void main() {
     if (laneId < 28u) {
         uint blockIdx = row * 28u + laneId;
         uvec4 packed_w = W[blockIdx];
-        float16_t d = scales[blockIdx];
+        float16_t d = scales[blockIdx >> SCALE_SHIFT];
 
         uint x_base = laneId * 8u;
         float16_t group_dot = float16_t(0.0);

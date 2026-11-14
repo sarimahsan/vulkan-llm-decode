@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuffer {
+    uvec4 inData[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer SinkBuffer {
+    uvec4 sinkData[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint numElements; // total number of uvec4 elements
+} pc;
+
+void main() {
+    uint baseIdx = gl_GlobalInvocationID.x * 4u;
+    uvec4 acc = uvec4(0u);
+
+    if (baseIdx + 3u < pc.numElements) {
+        acc ^= inData[baseIdx + 0u];
+        acc ^= inData[baseIdx + 1u];
+        acc ^= inData[baseIdx + 2u];
+        acc ^= inData[baseIdx + 3u];
+    } else {
+        for (uint i = 0u; i < 4u; ++i) {
+            uint idx = baseIdx + i;
+            if (idx < pc.numElements) {
+                acc ^= inData[idx];
+            }
+        }
+    }
+
+    // Prevent dead-code elimination of the loads without writing to DRAM
+    if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0xFFFFFFFFu && gl_GlobalInvocationID.x == 0xFFFFFFFFu) {
+        sinkData[0] = acc;
+    }
+}

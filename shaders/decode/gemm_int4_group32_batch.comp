@@ -18,6 +18,8 @@ layout(push_constant) uniform PushConstants {
     uint M;         // Batch size (1..4)
 } pc;
 
+layout(constant_id = 0) const uint SCALE_SHIFT = 0u;
+
 void main() {
     uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
     if (row >= pc.N) return;
@@ -34,7 +36,7 @@ void main() {
     for (uint col = laneId; col < pc.K_group32; col += 32u) {
         uint blockIdx = rowOffset + col;
         uvec4 packed_w = W[blockIdx];
-        float16_t d = scales[blockIdx];
+        float16_t d = scales[blockIdx >> SCALE_SHIFT];
         uint x_base = col * 8u;
 
         float16_t gd0 = float16_t(0.0);

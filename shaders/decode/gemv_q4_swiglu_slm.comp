@@ -19,6 +19,8 @@ layout(push_constant) uniform PushConstants {
     uint N;         // Intermediate size (I)
 } pc;
 
+layout(constant_id = 0) const uint SCALE_SHIFT = 0u;
+
 shared f16vec4 s_x[256]; // Up to K = 1024 (256 f16vec4s = 2 KB SLM)
 
 void main() {
@@ -43,8 +45,8 @@ void main() {
         uint blockIdx = rowOffset + col;
         uvec4 pg = W_gate[blockIdx];
         uvec4 pu = W_up[blockIdx];
-        float16_t dg = S_gate[blockIdx];
-        float16_t du = S_up[blockIdx];
+        float16_t dg = S_gate[blockIdx >> SCALE_SHIFT];
+        float16_t du = S_up[blockIdx >> SCALE_SHIFT];
 
         uint x_base = col * 8u;
         float16_t gd_g = float16_t(0.0);

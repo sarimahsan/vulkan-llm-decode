@@ -1,0 +1,74 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Batched (M=1..4) Group-128 3-bit GEMM (for FFN Down projection)
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer InputMatrix  { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer WeightMatrix { uint W[]; };
+layout(set = 0, binding = 2) readonly buffer ScaleMatrix  { float16_t scales[]; };
+layout(set = 0, binding = 3) writeonly buffer OutputMatrix { float16_t y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint K_group32;
+    uint N;
+    uint M;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    if (row >= pc.N) return;
+
+    uint laneId = gl_LocalInvocationID.x;
+    uint K_vec4 = pc.K_group32 * 8u;
+    float16_t acc[4];
+    for (uint m = 0u; m < pc.M; ++m) acc[m] = float16_t(0.0);
+
+    uint rowOffset = row * pc.K_group32;
+    for (uint col = laneId; col < pc.K_group32; col += 32u) {
+        uint blockIdx = rowOffset + col;
+        uint wIdx = blockIdx * 3u;
+        uint u0 = W[wIdx + 0u];
+        uint u1 = W[wIdx + 1u];
+        uint u2 = W[wIdx + 2u];
+        float16_t d = scales[blockIdx >> 2u];
+        uint xb = col * 8u;
+
+        f16vec4 w0 = f16vec4(float16_t(int((u0 >>  0u) & 7u) - 4), float16_t(int((u0 >>  3u) & 7u) - 4),
+                             float16_t(int((u0 >>  6u) & 7u) - 4), float16_t(int((u0 >>  9u) & 7u) - 4));
+        f16vec4 w1 = f16vec4(float16_t(int((u0 >> 12u) & 7u) - 4), float16_t(int((u0 >> 15u) & 7u) - 4),
+                             float16_t(int((u0 >> 18u) & 7u) - 4), float16_t(int((u0 >> 21u) & 7u) - 4));
+        f16vec4 w2 = f16vec4(float16_t(int((u0 >> 24u) & 7u) - 4), float16_t(int((u0 >> 27u) & 7u) - 4),
+                             float16_t(int((u1 >>  0u) & 7u) - 4), float16_t(int((u1 >>  3u) & 7u) - 4));
+        f16vec4 w3 = f16vec4(float16_t(int((u1 >>  6u) & 7u) - 4), float16_t(int((u1 >>  9u) & 7u) - 4),
+                             float16_t(int((u1 >> 12u) & 7u) - 4), float16_t(int((u1 >> 15u) & 7u) - 4));
+        f16vec4 w4 = f16vec4(float16_t(int((u1 >> 18u) & 7u) - 4), float16_t(int((u1 >> 21u) & 7u) - 4),
+                             float16_t(int((u1 >> 24u) & 7u) - 4), float16_t(int((u1 >> 27u) & 7u) - 4));
+        f16vec4 w5 = f16vec4(float16_t(int((u2 >>  0u) & 7u) - 4), float16_t(int((u2 >>  3u) & 7u) - 4),
+                             float16_t(int((u2 >>  6u) & 7u) - 4), float16_t(int((u2 >>  9u) & 7u) - 4));
+        f16vec4 w6 = f16vec4(float16_t(int((u2 >> 12u) & 7u) - 4), float16_t(int((u2 >> 15u) & 7u) - 4),
+                             float16_t(int((u2 >> 18u) & 7u) - 4), float16_t(int((u2 >> 21u) & 7u) - 4));
+        uint q30 = (u0 >> 30u) | ((u2 >> 28u) & 4u);
+        uint q31 = (u1 >> 30u) | ((u2 >> 29u) & 4u);
+        f16vec4 w7 = f16vec4(float16_t(int((u2 >> 24u) & 7u) - 4), float16_t(int((u2 >> 27u) & 7u) - 4),
+                             float16_t(int(q30) - 4), float16_t(int(q31) - 4));
+
+        for (uint m = 0u; m < pc.M; ++m) {
+            uint xm = m * K_vec4 + xb;
+            float16_t gd = dot(w0, x[xm + 0u]) + dot(w1, x[xm + 1u])
+                         + dot(w2, x[xm + 2u]) + dot(w3, x[xm + 3u])
+                         + dot(w4, x[xm + 4u]) + dot(w5, x[xm + 5u])
+                         + dot(w6, x[xm + 6u]) + dot(w7, x[xm + 7u]);
+            acc[m] += gd * d;
+        }
+    }
+
+    for (uint m = 0u; m < pc.M; ++m) {
+        float16_t rowSum = subgroupAdd(acc[m]);
+        if (laneId == 0u) {
+            y[m * pc.N + row] = rowSum;
+        }
+    }
+}
