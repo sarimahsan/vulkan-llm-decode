@@ -14,9 +14,9 @@ LLM autoregressive generation (token decoding at batch size $M=1$) is almost exc
 
 $$\text{Tokens/sec} \approx \frac{\text{Memory Bandwidth (GB/s)}}{\text{Model Size (GB)}}$$
 
-On integrated GPUs (such as Intel UHD Graphics / Xe-LP), the GPU shares system DRAM with the CPU. With physical DRAM bandwidth measured at **~16.28 GB/s**, a 0.5B model in INT4 (~295 MB) has a strict physical roofline ceiling:
+On integrated GPUs (such as Intel UHD Graphics / Xe-LP), the GPU shares system DRAM with the CPU. With pure streaming-read DRAM bandwidth measured at **18.44 GB/s** (300 MB buffer, AC power), a 0.5B model in INT4 (~295 MB) has a strict physical roofline ceiling:
 
-$$\text{Roofline Ceiling} \approx \frac{16.28\text{ GB/s}}{0.295\text{ GB}} \approx \mathbf{55.2\text{ tokens/sec}}$$
+$$\text{Roofline Ceiling} \approx \frac{18.44\text{ GB/s}}{0.295\text{ GB}} \approx \mathbf{62.5\text{ tokens/sec}}$$
 
 ### Core Research Questions
 1. **Roofline Efficiency:** How close can a fused dequantize-and-multiply GEMV get to the physical DRAM memory roofline on Xe-LP?
@@ -65,30 +65,30 @@ Set-Content -Path qwen_cfg.txt -Value "--vocab 65536 --g128 --no-spec" -NoNewlin
 
 ## 🏆 End-to-End Inference Results: Qwen2.5-0.5B-Instruct (`Q4_0`)
 
-Measured on **Intel(R) UHD Graphics (Xe-LP)** generating **160 tokens** (greedy decode with self-speculative drafting & batched verification), averaged across **5 consecutive runs (`mean ± stddev`)**:
+Measured on **Intel(R) UHD Graphics (Xe-LP)** on AC power generating **160 tokens** (`tg160`, greedy decode), averaged across **5 consecutive runs**:
 
+### 1. Fair Comparison (Full 151,936 Vocab, Same `Q4_0` GGUF)
 | Engine / Backend | Mode | Throughput (`tg160`) | Notes |
 |:---|:---:|:---:|:---|
-| **vulkan-llm-decode (`--vocab 65536 --g128 --no-spec`)** | **GPU-Only (AC Power)** | **80.01 tok/s** | 5-run avg (`12.50 ms/tok`, peak `82.77 tok/s`, pruned+g128) |
-| **vulkan-llm-decode (`--vocab 65536 --g128 --no-spec`)** | **Wall-Clock (AC Power)** | **77.28 tok/s** | 5-run avg (`12.94 ms/tok`, peak `79.94 tok/s`, pruned+g128) |
-| **vulkan-llm-decode (`--no-spec`, full vocab `Q4_0`)** | **GPU-Only (AC Power)** | **51.71 tok/s** | 5-run avg (apples-to-apples full `Q4_0`, peak `53.89 tok/s`) |
-| **vulkan-llm-decode (`--no-spec`, full vocab `Q4_0`)** | **Wall-Clock (AC Power)** | **50.47 tok/s** | 5-run avg (apples-to-apples full `Q4_0`, peak `52.67 tok/s`) |
-| `llama.cpp` (`llama-bench`, `ngl=99`) | Vulkan iGPU (AC Power) | 46.38 ± 0.97 tok/s | `build 2d8a32502 (12360)` |
-| `llama.cpp` (`llama-bench`, `ngl=0`) | CPU-Only (AC Power) | 52.26 ± 0.66 tok/s | `build 2d8a32502 (12360)` (`ggml-cpu-alderlake`) |
+| **vulkan-llm-decode (`--no-spec`, full vocab `Q4_0`)** | **GPU-Only (Vulkan)** | **51.71 ± 2.02 tok/s** | 5-run avg (peak `53.89 tok/s`, ~11.5% faster than `llama.cpp` Vulkan) |
+| **vulkan-llm-decode (`--no-spec`, full vocab `Q4_0`)** | **Wall-Clock (Vulkan)** | **50.47 ± 1.98 tok/s** | 5-run avg (peak `52.67 tok/s`, ~8.8% faster than `llama.cpp` Vulkan) |
+| `llama.cpp` (`llama-bench`, `ngl=99`) | Vulkan iGPU | 46.38 ± 0.97 tok/s | `build 2d8a32502 (12360)` |
+| `llama.cpp` (`llama-bench`, `ngl=0`) | CPU-Only (`alderlake`) | 52.26 ± 0.66 tok/s | `build 2d8a32502 (12360)` |
 
 ### Experimental Observations
 *Note: `qwen_decode.exe` is a specialized, experimental greedy-decode prototype for Qwen2.5-0.5B, whereas `llama.cpp` is a full general-purpose engine supporting many architectures, samplers, and backends.*
-* **Full-vocab `Q4_0` (`--no-spec`, 151,936 vocab):** `51.71 tok/s` GPU-only / `50.47 tok/s` wall-clock on AC power, compared to `46.38 tok/s` (`llama-bench` Vulkan) and `52.26 tok/s` (`llama-bench` CPU) on the same GGUF and hardware.
-* **Pruned vocab + Group-128 (`--vocab 65536 --g128 --no-spec`):** `80.01 tok/s` GPU-only / `77.28 tok/s` wall-clock (~`16.9 GB/s`, or ~`91.6%` of the `18.44 GB/s` 300 MB streaming-read peak) by shrinking per-token reads from ~278 MB to ~211 MB.
+* **Vulkan iGPU vs `llama.cpp` Vulkan:** On the identical `Q4_0` GGUF and full 151,936 vocabulary, `qwen_decode.exe` (`51.71 tok/s` GPU / `50.47 tok/s` wall) outperforms `llama.cpp`'s Vulkan backend (`46.38 tok/s`) by ~11.5% (GPU) / ~8.8% (wall-clock).
+* **Why CPU (`52.26 tok/s`) and iGPU (`51.71 tok/s`) land close:** On this integrated-GPU laptop, the CPU and Intel UHD Graphics share the exact same physical DRAM bus. Since single-token `Q4_0` decode is memory-bandwidth bound (~278 MB/token), both backends hit the same system DRAM ceiling rather than compute limits.
 * **Minimal Vulkan Runtime (`src/engine/qwen_decode.c`):** Direct GGUF loading (`src/engine/gguf.h`), fused SLM Q4_0 dequant-GEMV and fused SwiGLU kernels, dynamic RoPE, KV-cache append, grouped-query attention decode, and 2-pass GPU argmax.
 * **Self-Speculative Batched Decode:** Experimental batched `GEMM`/`attention` verification (`147 steps | drafted=55, accepted=12 (21.8% accept, 1.08 tok/step)`).
 
-### Bandwidth-Reduction & Drafting Optimizations (`qwen_cfg.txt`)
-Added runtime flags via `qwen_cfg.txt` to reduce bytes read per token below the original ~278 MB `Q4_0` footprint:
+### 2. Bandwidth-Reduction Experiments (`qwen_cfg.txt`)
+These modes reduce **bytes read per token** below the ~278 MB `Q4_0` footprint (faster because fewer bytes cross the memory bus, not because the compute kernels are faster):
 * **Re-measured AC-Power Roofline (300 MB Pure Streaming Read, `bandwidth_benchmark.exe`):** **18.44 GB/s peak** (`17.056 ms`) / **16.99 GB/s average** (`18.520 ms` across 10 runs).
-* **`--vocab 65536 --g128 --no-spec` (Vocab Pruning + Group-128 Scales, `4.125 bpw`, ~211 MB/token):**
-  * **5-run average (AC power):** **77.28 tok/s wall-clock** (`12.94 ms/tok`) / **80.01 tok/s GPU-only** (`12.50 ms/tok`, ~**16.9 GB/s** = **91.6% of 18.44 GB/s peak** / **99.5% of 16.99 GB/s avg**; peak run **79.94 tok/s wall / 82.77 tok/s GPU**).
-  * **5-run average (unplugged):** **66.70 tok/s wall-clock** / **70.28 tok/s GPU-only**.
+* **`--vocab 65536 --g128 --no-spec` (Vocab Pruning + Group-128 Scales, `4.125 bpw`, ~211 MB/token vs ~278 MB):**
+  * **5-run average (AC power):** **80.01 ± 2.11 tok/s GPU-only** (`12.50 ms/tok`) / **77.28 ± 2.05 tok/s wall-clock** (`12.94 ms/tok`, ~**16.9 GB/s** = **91.6% of 18.44 GB/s peak** / **99.5% of 16.99 GB/s avg**; peak run **82.77 tok/s GPU / 79.94 tok/s wall**). Reads ~211 MB/token vs ~295 MB, so the roofline ceiling moves to ~87 tok/s.
+  * **5-run average (unplugged):** **70.28 tok/s GPU-only** / **66.70 tok/s wall-clock**.
+  * **Quality note (not lossless):** Output remained **coherent on our English test prompt**, though naive prefix slicing (`id < 65,536`) is not lossless: on the GPU prompt, full `151,936` vs `--vocab 65536` matched until `' interconnected'` (token ID `82,316 >= 65,536`), where the pruned run fell back to `' independent'`. Many rare/technical tokens sit below `65,536` (`' ubiquitous' = 63,464`, `' constexpr' = 19,512`), while some domain tokens sit above it (`' ATP' = 66,556`, `' oxidative' = 78,301`, `' phosphory' = 93,989`).
   * **Full vocab + Group-128 (`--g128 --no-spec`, ~255 MB/token):** **63.56 tok/s wall-clock** / **66.28 tok/s GPU-only** vs `52.18 / 54.20 tok/s` baseline.
 * **`--smart-draft` (4..2-gram + phrase corpus + 1-gram fallback):** Raised `tok/step` from `1.08` to `1.17` (`1.42` with `--vocab 65536 --g128`), but low acceptance on general chat (`12.2%–23.9%`) adds `M=4` batched compute overhead on the UHD EUs (`36.28 / 47.39 tok/s`), so `--no-spec` remains faster for general text while `--code` / `--json` benefit on repetitive tokens.
 * **`--q3-ffn` (3-bit FFN + Group-128, `3.125 bpw`):** Cut FFN latency to `L0 = 0.461 ms` (`Gate+Up+SwiGLU = 181.51 us`, `Down = 103.85 us`, **60.83 tok/s wall / 64.21 tok/s GPU** full-vocab `spec=OFF`), but double-quantizing `Q4_0` FFN weights to 3-bit without calibration degrades Qwen2.5-0.5B output coherence.
